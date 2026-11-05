@@ -1,9 +1,10 @@
 use std::cell::{Cell, RefCell};
-use std::ffi::OsString;
+use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::os::fd::OwnedFd;
 use std::os::unix::prelude::AsRawFd;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use std::{fs, mem, panic};
 
@@ -115,6 +116,83 @@ where
             None
         }
     })
+}
+
+#[derive(Clone, Debug)]
+struct CachedAppletDesktop {
+    path: std::path::PathBuf,
+    exec: String,
+    requests_wayland_display: bool,
+    shrink_min_size: Option<ClientShrinkSize>,
+    shrink_priority: Option<u32>,
+    padding_shrinkable: bool,
+    minimize_priority: Option<u32>,
+    auto_popup_hover_press: Option<AppletAutoClickAnchor>,
+    is_notification_applet: bool,
+}
+
+/// Desktop-entry metadata is immutable for the life of a panel process. Each
+/// PanelSpace previously re-read and re-parsed every desktop entry while
+/// spawning applets, so cache the first matching entry per applet id. Panel
+/// restarts are already required for newly installed applets to appear.
+static APPLET_DESKTOP_CACHE: LazyLock<HashMap<OsString, CachedAppletDesktop>> =
+    LazyLock::new(load_applet_desktop_cache);
+
+fn load_applet_desktop_cache() -> HashMap<OsString, CachedAppletDesktop> {
+    let mut cache = HashMap::new();
+    let locales = freedesktop_desktop_entry::get_languages_from_env();
+
+    for path in Iter::new(freedesktop_desktop_entry::default_paths()) {
+        let Some(file_stem) = path.file_stem().map(OsStr::to_os_string) else {
+            continue;
+        };
+        if cache.contains_key(&file_stem) {
+            continue;
+        }
+
+        let Ok(bytes) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(entry) = DesktopEntry::from_str(&path, &bytes, Some(&locales)) else {
+            continue;
+        };
+        let Some(exec) = entry.exec() else {
+            continue;
+        };
+
+        let minimize_priority = entry
+            .desktop_entry("X-MinimizeApplet")
+            .map(|value| value.parse::<u32>().unwrap_or_default());
+
+        cache.insert(
+            file_stem,
+            CachedAppletDesktop {
+                path: path.clone(),
+                exec: exec.to_string(),
+                requests_wayland_display: entry.desktop_entry("X-HostWaylandDisplay").is_some(),
+                shrink_min_size: entry
+                    .desktop_entry("X-OverflowMinSize")
+                    .or_else(|| entry.desktop_entry("X-CosmicOverflowMinSize"))
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .map(ClientShrinkSize::AppletUnit),
+                shrink_priority: entry
+                    .desktop_entry("X-OverflowPriority")
+                    .or_else(|| entry.desktop_entry("X-CosmicOverflowPriority"))
+                    .and_then(|value| value.parse::<u32>().ok()),
+                padding_shrinkable: entry
+                    .desktop_entry("X-CosmicShrinkable")
+                    .map(|value| value == "true")
+                    .unwrap_or_default(),
+                minimize_priority,
+                auto_popup_hover_press: entry
+                    .desktop_entry("X-CosmicHoverPopup")
+                    .map(|value| value.parse::<AppletAutoClickAnchor>().unwrap_or_default()),
+                is_notification_applet: entry.desktop_entry("X-NotificationsApplet").is_some(),
+            },
+        );
+    }
+
+    cache
 }
 
 impl WrapperSpace for PanelSpace {
@@ -457,65 +535,28 @@ impl WrapperSpace for PanelSpace {
 
             let mut panel_clients: Vec<(&mut PanelClient, Arc<Mutex<Vec<PanelClient>>>, Side)> =
                 Vec::new();
-            let locales = freedesktop_desktop_entry::get_languages_from_env();
 
-            for path in Iter::new(freedesktop_desktop_entry::default_paths()) {
-                // This way each applet is at most started once,
-                // even if multiple desktop files in different directories match
-                if let Some(position) =
-                    desktop_ids.iter().position(|(PanelClient { name, .. }, ..)| {
-                        Some(OsString::from(name).as_os_str()) == path.file_stem()
-                    })
-                {
-                    let (panel_client, my_list, panel_side) = desktop_ids.remove(position);
-                    info!(panel_client.name);
+            for (panel_client, my_list, panel_side) in desktop_ids {
+                let Some(metadata) = APPLET_DESKTOP_CACHE.get(OsStr::new(&panel_client.name))
+                else {
+                    continue;
+                };
 
-                    if let Ok(bytes) = fs::read_to_string(&path)
-                        && let Ok(entry) = DesktopEntry::from_str(&path, &bytes, Some(&locales))
-                        && let Some(exec) = entry.exec()
-                    {
-                        panel_client.path = Some(path.clone());
-                        panel_client.exec = Some(exec.to_string());
-                        panel_client.requests_wayland_display =
-                            Some(entry.desktop_entry("X-HostWaylandDisplay").is_some());
-                        panel_client.shrink_min_size = entry
-                            .desktop_entry("X-OverflowMinSize")
-                            .or_else(|| entry.desktop_entry("X-CosmicOverflowMinSize"))
-                            .and_then(|x| x.parse::<u32>().ok())
-                            .map(ClientShrinkSize::AppletUnit);
-                        panel_client.shrink_priority = entry
-                            .desktop_entry("X-OverflowPriority")
-                            .or_else(|| entry.desktop_entry("X-CosmicOverflowPriority"))
-                            .and_then(|x| x.parse::<u32>().ok());
-                        panel_client.padding_shrinkable = entry
-                            .desktop_entry("X-CosmicShrinkable")
-                            .map(|x| x == "true")
-                            .unwrap_or_default();
-
-                        panel_client.minimize_priority = if let Some(x_minimize_entry) =
-                            entry.desktop_entry("X-MinimizeApplet")
-                        {
-                            match x_minimize_entry.parse::<u32>() {
-                                Ok(p) => {
-                                    max_minimize_priority = max_minimize_priority.max(p);
-                                    Some(p)
-                                },
-                                Err(_) => Some(0),
-                            }
-                        } else {
-                            None
-                        };
-
-                        panel_client.auto_popup_hover_press = entry
-                            .desktop_entry("X-CosmicHoverPopup")
-                            .map(|v| v.parse::<AppletAutoClickAnchor>().unwrap_or_default());
-
-                        panel_client.is_notification_applet =
-                            Some(entry.desktop_entry("X-NotificationsApplet").is_some());
-
-                        panel_clients.push((panel_client, my_list, panel_side));
-                    }
+                info!(panel_client.name);
+                panel_client.path = Some(metadata.path.clone());
+                panel_client.exec = Some(metadata.exec.clone());
+                panel_client.requests_wayland_display = Some(metadata.requests_wayland_display);
+                panel_client.shrink_min_size = metadata.shrink_min_size;
+                panel_client.shrink_priority = metadata.shrink_priority;
+                panel_client.padding_shrinkable = metadata.padding_shrinkable;
+                panel_client.minimize_priority = metadata.minimize_priority;
+                if let Some(priority) = metadata.minimize_priority {
+                    max_minimize_priority = max_minimize_priority.max(priority);
                 }
+                panel_client.auto_popup_hover_press = metadata.auto_popup_hover_press;
+                panel_client.is_notification_applet = Some(metadata.is_notification_applet);
+
+                panel_clients.push((panel_client, my_list, panel_side));
             }
 
             // only allow 1 per panel
